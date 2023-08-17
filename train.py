@@ -27,13 +27,18 @@ import torch
 import torch.nn as nn
 import torchvision.utils
 import yaml
+from data_sharing import SharedLoader
 from torch.nn.parallel import DistributedDataParallel as NativeDDP
 
 from timm import utils
-from timm.data import create_dataset, create_loader, resolve_data_config, Mixup, FastCollateMixup, AugMixDataset
-from timm.layers import convert_splitbn_model, convert_sync_batchnorm, set_fast_norm
-from timm.loss import JsdCrossEntropy, SoftTargetCrossEntropy, BinaryCrossEntropy, LabelSmoothingCrossEntropy
-from timm.models import create_model, safe_model_name, resume_checkpoint, load_checkpoint, model_parameters
+from timm.data import (AugMixDataset, FastCollateMixup, Mixup, create_dataset,
+                       create_loader, resolve_data_config)
+from timm.layers import (convert_splitbn_model, convert_sync_batchnorm,
+                         set_fast_norm)
+from timm.loss import (BinaryCrossEntropy, JsdCrossEntropy,
+                       LabelSmoothingCrossEntropy, SoftTargetCrossEntropy)
+from timm.models import (create_model, load_checkpoint, model_parameters,
+                         resume_checkpoint, safe_model_name)
 from timm.optim import create_optimizer_v2, optimizer_kwargs
 from timm.scheduler import create_scheduler_v2, scheduler_kwargs
 from timm.utils import ApexScaler, NativeScaler
@@ -69,6 +74,7 @@ has_compile = hasattr(torch, 'compile')
 
 
 _logger = logging.getLogger('train')
+_logger.setLevel(logging.WARNING)
 
 # The first arg parser parses out only the --config argument, this argument is used to
 # load a yaml file containing key-values that override the defaults for the main parser below
@@ -354,7 +360,8 @@ group.add_argument('--use-multi-epochs-loader', action='store_true', default=Fal
                    help='use the multi-epochs-loader to save time at the beginning of every epoch')
 group.add_argument('--log-wandb', action='store_true', default=False,
                    help='log training and validation metrics to wandb')
-
+group.add_argument('--shared-loader', type=int, default=0,
+                   help='whether to use the shared data loader. remember to instantiate producer.')
 
 def _parse_args():
     # Do we have a config file to parse?
@@ -629,36 +636,40 @@ def main():
     train_interpolation = args.train_interpolation
     if args.no_aug or not train_interpolation:
         train_interpolation = data_config['interpolation']
-    loader_train = create_loader(
-        dataset_train,
-        input_size=data_config['input_size'],
-        batch_size=args.batch_size,
-        is_training=True,
-        use_prefetcher=args.prefetcher,
-        no_aug=args.no_aug,
-        re_prob=args.reprob,
-        re_mode=args.remode,
-        re_count=args.recount,
-        re_split=args.resplit,
-        scale=args.scale,
-        ratio=args.ratio,
-        hflip=args.hflip,
-        vflip=args.vflip,
-        color_jitter=args.color_jitter,
-        auto_augment=args.aa,
-        num_aug_repeats=args.aug_repeats,
-        num_aug_splits=num_aug_splits,
-        interpolation=train_interpolation,
-        mean=data_config['mean'],
-        std=data_config['std'],
-        num_workers=args.workers,
-        distributed=args.distributed,
-        collate_fn=collate_fn,
-        pin_memory=args.pin_mem,
-        device=device,
-        use_multi_epochs_loader=args.use_multi_epochs_loader,
-        worker_seeding=args.worker_seeding,
-    )
+    
+    if not args.shared_loader:
+        loader_train = create_loader(
+            dataset_train,
+            input_size=data_config['input_size'],
+            batch_size=args.batch_size,
+            is_training=True,
+            use_prefetcher=args.prefetcher,
+            no_aug=args.no_aug,
+            re_prob=args.reprob,
+            re_mode=args.remode,
+            re_count=args.recount,
+            re_split=args.resplit,
+            scale=args.scale,
+            ratio=args.ratio,
+            hflip=args.hflip,
+            vflip=args.vflip,
+            color_jitter=args.color_jitter,
+            auto_augment=args.aa,
+            num_aug_repeats=args.aug_repeats,
+            num_aug_splits=num_aug_splits,
+            interpolation=train_interpolation,
+            mean=data_config['mean'],
+            std=data_config['std'],
+            num_workers=args.workers,
+            distributed=args.distributed,
+            collate_fn=collate_fn,
+            pin_memory=args.pin_mem,
+            device=device,
+            use_multi_epochs_loader=args.use_multi_epochs_loader,
+            worker_seeding=args.worker_seeding,
+        )
+    else:
+        loader_train = SharedLoader()
 
     eval_workers = args.workers
     if args.distributed and ('tfds' in args.dataset or 'wds' in args.dataset):
@@ -790,7 +801,7 @@ def main():
                     _logger.info("Distributing BatchNorm running means and vars")
                 utils.distribute_bn(model, args.world_size, args.dist_bn == 'reduce')
 
-            eval_metrics = validate(
+            """ eval_metrics = validate(
                 model,
                 loader_eval,
                 validate_loss_fn,
@@ -827,11 +838,12 @@ def main():
             if saver is not None:
                 # save proper checkpoint with eval metric
                 save_metric = eval_metrics[eval_metric]
-                best_metric, best_epoch = saver.save_checkpoint(epoch, metric=save_metric)
+                best_metric, best_epoch = saver.save_checkpoint(epoch, metric=save_metric) """
 
             if lr_scheduler is not None:
                 # step LR for next epoch
-                lr_scheduler.step(epoch + 1, eval_metrics[eval_metric])
+                #lr_scheduler.step(epoch + 1, eval_metrics[eval_metric])
+                lr_scheduler.step(epoch + 1)
 
     except KeyboardInterrupt:
         pass
@@ -882,7 +894,8 @@ def train_one_epoch(
     update_sample_count = 0
     for batch_idx, (input, target) in enumerate(loader):
         last_batch = batch_idx == last_batch_idx
-        need_update = last_batch or (batch_idx + 1) % accum_steps == 0
+        need_update = last_batch or (batch_idx + 1) % max(accum_steps,1) == 0
+        _logger.warning(f"last_batch {last_batch}, batch_idx {batch_idx}, accum_steps {accum_steps}")
         update_idx = batch_idx // accum_steps
         if batch_idx >= last_batch_idx_to_accum:
             accum_steps = last_accum_steps
